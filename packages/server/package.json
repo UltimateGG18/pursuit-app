@@ -1,0 +1,37 @@
+{
+  "name": "@pursuit/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PURSUIT backend API (Day 1: ICP configuration persistence)",
+  "main": "./dist/server.js",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prisma:validate": "prisma validate && prisma format --check",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:migrate-check": "prisma migrate status && prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --exit-code",
+    "prisma:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@prisma/client": "^6.1.0",
+    "@pursuit/shared": "*",
+    "fastify": "^5.2.0",
+    "groq-sdk": "^1.6.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "prisma": "^6.1.0",
+    "tsx": "^4.23.13",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.5"
+  }
+}

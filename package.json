@@ -1,0 +1,44 @@
+{
+  "name": "pursuit",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "PURSUIT - Prospect Search & Intelligence Engine (Day 1: ICP vertical slice)",
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/web"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "setup:env": "node scripts/setup-env.mjs",
+    "build": "npm run build -w @pursuit/shared && npm run build -w @pursuit/server && npm run build -w @pursuit/web",
+    "build:shared": "npm run build -w @pursuit/shared",
+    "build:server": "npm run build -w @pursuit/server",
+    "build:web": "npm run build -w @pursuit/web",
+    "typecheck": "npm run typecheck -w @pursuit/shared && npm run typecheck -w @pursuit/server && npm run typecheck -w @pursuit/web",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "npm run test -w @pursuit/shared && npm run test -w @pursuit/server && npm run test -w @pursuit/web",
+    "prisma:validate": "npm run prisma:validate -w @pursuit/server",
+    "prisma:generate": "npm run prisma:generate -w @pursuit/server",
+    "prisma:migrate": "npm run prisma:migrate -w @pursuit/server",
+    "prisma:deploy": "npm run prisma:deploy -w @pursuit/server",
+    "prisma:migrate-check": "npm run prisma:migrate-check -w @pursuit/server",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "dev": "concurrently \"npm run dev -w @pursuit/server\" \"npm run dev -w @pursuit/web\"",
+    "verify": "npm run setup:env && npm run build:shared && npm run typecheck && npm run lint && npm run test && npm run prisma:validate && npm run build:server && npm run build:web"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "concurrently": "^10.0.5",
+    "eslint": "^9.17.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^15.14.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.2"
+  }
+}

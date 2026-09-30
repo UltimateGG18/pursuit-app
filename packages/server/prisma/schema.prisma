@@ -1,0 +1,355 @@
+// PURSUIT - Day 1 schema.
+//
+// The ICP configuration is stored as JSON rather than being exploded into
+// dozens of relational tables: the shape is validated by a versioned Zod
+// contract (`icp.v1`) and read as a whole by the pipeline, so relational
+// decomposition would add joins without adding a single query we need today.
+//
+// Two JSON columns are kept per version on purpose:
+//   config           - normalized configuration, what the pipeline reads
+//   submittedConfig  - the exact payload the client sent, never rewritten
+//
+// Every write appends an ICPProfileVersion row, so no submitted configuration
+// is ever lost or overwritten.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum IcpStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+model ICPProfile {
+  id              String    @id @default(uuid()) @db.Uuid
+  name            String    @db.VarChar(120)
+  /// Lookup key derived from the name; used to detect duplicate profiles.
+  slug            String    @db.VarChar(80)
+  description     String?
+  /// Version of the latest stored configuration. Starts at 1, incremented on update.
+  version         Int       @default(1)
+  status          IcpStatus @default(ACTIVE)
+  /// Version of the ICP configuration contract, e.g. `icp.v1`.
+  schemaVersion   String    @map("schema_version") @db.VarChar(32)
+  config          Json
+  submittedConfig Json      @map("submitted_config")
+  scoringWeights  Json      @map("scoring_weights")
+  createdBy       String?   @map("created_by") @db.VarChar(120)
+  changeReason    String?   @map("change_reason") @db.VarChar(280)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  /// Set by DELETE. Archival keeps the configuration history recoverable.
+  deletedAt       DateTime? @map("deleted_at")
+
+  versions   ICPProfileVersion[]
+  analyses   ICPAnalysis[]
+  searchRuns SearchRun[]
+
+  @@index([slug])
+  @@index([status])
+  @@index([deletedAt])
+  @@map("icp_profiles")
+}
+
+model ICPProfileVersion {
+  id              String    @id @default(uuid()) @db.Uuid
+  icpProfileId    String    @map("icp_profile_id") @db.Uuid
+  version         Int
+  status          IcpStatus
+  schemaVersion   String    @map("schema_version") @db.VarChar(32)
+  config          Json
+  submittedConfig Json      @map("submitted_config")
+  scoringWeights  Json      @map("scoring_weights")
+  createdBy       String?   @map("created_by") @db.VarChar(120)
+  changeReason    String?   @map("change_reason") @db.VarChar(280)
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  profile ICPProfile @relation(fields: [icpProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([icpProfileId, version])
+  @@index([icpProfileId])
+  @@map("icp_profile_versions")
+}
+
+/// Lifecycle of one model analysis run. RUNNING is written before the model is
+/// called, so a crashed or timed-out run leaves a row behind rather than
+/// vanishing.
+enum IcpAnalysisStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// A single ICP -> model -> structured analysis run.
+///
+/// `inputSnapshot` holds the exact normalized ICP that was sent, so the
+/// question "which configuration produced this result?" is answerable after the
+/// ICP has been edited. `output` is only ever written after the payload has
+/// passed the `icp-analysis.v1` Zod contract, so a FAILED row can never be
+/// mistaken for a usable result.
+model ICPAnalysis {
+  id                    String            @id @default(uuid()) @db.Uuid
+  icpProfileId          String            @map("icp_profile_id") @db.Uuid
+  /// Version of the ICP this analysis ran against.
+  icpVersion            Int               @map("icp_version")
+  status                IcpAnalysisStatus @default(PENDING)
+  /// Provider id, e.g. `groq`.
+  provider              String            @db.VarChar(64)
+  /// Concrete model, e.g. `openai/gpt-oss-20b`.
+  model                 String            @db.VarChar(120)
+  /// Version of the prompt that produced this result.
+  promptVersion         String            @map("prompt_version") @db.VarChar(32)
+  /// Version of the analysis output contract, e.g. `icp-analysis.v1`.
+  analysisSchemaVersion String            @map("analysis_schema_version") @db.VarChar(32)
+  inputSnapshot         Json              @map("input_snapshot")
+  output                Json?
+  errorCode             String?           @map("error_code") @db.VarChar(64)
+  errorMessage          String?           @map("error_message")
+  durationMs            Int?              @map("duration_ms")
+  createdAt             DateTime          @default(now()) @map("created_at")
+  updatedAt             DateTime          @updatedAt @map("updated_at")
+
+  profile ICPProfile @relation(fields: [icpProfileId], references: [id], onDelete: Cascade)
+
+  @@index([icpProfileId, createdAt])
+  @@index([status])
+  @@map("icp_analyses")
+}
+
+/// Where a candidate ended up after deterministic processing.
+///
+/// The three states stage 1 can actually reach. QUALIFICATION_PENDING,
+/// QUALIFIED and OUTREACH belong to the stages after this one and are absent
+/// rather than stubbed, so no row can claim a lifecycle step that has no code
+/// behind it.
+enum CandidateState {
+  SURVIVOR
+  SUPPRESSED
+  COLD
+}
+
+/// One execution of discovery + deterministic candidate processing.
+///
+/// The audit row the plan asks for: which criteria version ran, against which
+/// provider, when, and what the funnel looked like. `counts` is stored as JSON
+/// because it is read as a whole and its shape is owned by a versioned contract
+/// (`candidate-processing.v1`, recorded in `processing_version`) - exploding
+/// eight counters into eight columns would add a migration per future stage
+/// without making a single query we need any easier.
+model SearchRun {
+  id                String   @id @default(uuid()) @db.Uuid
+  icpProfileId      String   @map("icp_profile_id") @db.Uuid
+  /// Version of the ICP these candidates were filtered against.
+  icpVersion        Int      @map("icp_version")
+  /// The analysis that widened the query, when one was applied. Not a foreign
+  /// key: an analysis can be superseded, and losing the run's account of which
+  /// one it used would be worse than holding an id that no longer resolves.
+  analysisId        String?  @map("analysis_id") @db.Uuid
+  /// Provider id, e.g. `apollo`.
+  provider          String   @db.VarChar(64)
+  /// Version of the people query contract, e.g. `people-query.v1`.
+  queryVersion      String   @map("query_version") @db.VarChar(32)
+  /// Version of the processing contract, e.g. `candidate-processing.v1`.
+  processingVersion String   @map("processing_version") @db.VarChar(32)
+  startedAt         DateTime @map("started_at")
+  completedAt       DateTime @map("completed_at")
+  counts            Json
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  profile    ICPProfile          @relation(fields: [icpProfileId], references: [id], onDelete: Cascade)
+  candidates ProspectCandidate[]
+
+  @@index([icpProfileId, createdAt])
+  @@map("search_runs")
+}
+
+/// One canonical company, however many provider accounts resolved to it.
+///
+/// `identityKey` is the resolution result itself - `domain:example.com` or
+/// `ref:apollo:5f2a...` - and is unique, which is what makes the row idempotent
+/// across runs: tomorrow's search resolves the same company to the same key and
+/// updates this row instead of writing a second one.
+///
+/// Every column is nullable except the identity and the name, because every one
+/// of them is a fact a provider may simply not have reported. A default here
+/// would turn "not reported" into a claim.
+model Company {
+  id             String   @id @default(uuid()) @db.Uuid
+  identityKey    String   @unique @map("identity_key") @db.VarChar(255)
+  /// DOMAIN, PROVIDER_ID or UNRESOLVED - how confidently this entity was identified.
+  identityBasis  String   @map("identity_basis") @db.VarChar(16)
+  name           String   @db.VarChar(255)
+  /// Comparison form of the name. Never displayed; used for lookup and audit.
+  normalizedName String   @map("normalized_name") @db.VarChar(255)
+  domain         String?  @db.VarChar(255)
+  website        String?  @db.VarChar(2048)
+  /// ISO 3166-1 alpha-2, where a source's value could be mapped to one.
+  country        String?  @db.VarChar(2)
+  location       String?  @db.VarChar(255)
+  /// A provider's own industry label, kept verbatim.
+  industry       String?  @db.VarChar(160)
+  /// Internal `INDUSTRIES` values the provider label mapped to, if any.
+  industryCodes  String[] @map("industry_codes")
+  employeeCount  Int?     @map("employee_count")
+  linkedinUrl    String?  @map("linkedin_url") @db.VarChar(2048)
+  firstSeenAt    DateTime @default(now()) @map("first_seen_at")
+  lastSeenAt     DateTime @updatedAt @map("last_seen_at")
+
+  sources    CompanySource[]
+  candidates ProspectCandidate[]
+
+  @@index([domain])
+  @@index([normalizedName])
+  @@map("companies")
+}
+
+/// A provider account that resolved to a company - the plan's `company_sources`.
+///
+/// Kept so a merge can always be explained and, if it turns out to be wrong,
+/// unpicked: entity resolution never deletes duplicate history, it records it.
+/// No `raw_payload` column, deliberately - a provider payload is personal data
+/// with a retention question attached, and nothing in the pipeline reads one.
+model CompanySource {
+  id          String   @id @default(uuid()) @db.Uuid
+  companyId   String   @map("company_id") @db.Uuid
+  provider    String   @db.VarChar(64)
+  externalId  String   @map("external_id") @db.VarChar(128)
+  firstSeenAt DateTime @default(now()) @map("first_seen_at")
+  lastSeenAt  DateTime @updatedAt @map("last_seen_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, externalId])
+  @@index([companyId])
+  @@map("company_sources")
+}
+
+/// One person, as processed by one search run - survivor or cold pool.
+///
+/// Rejected candidates are stored, not dropped: the cold pool is how a
+/// too-narrow ICP is diagnosed, and how a candidate returns to qualification
+/// when new signals arrive. `rejections` holds the structured reasons, which is
+/// what makes the pool countable rather than merely recoverable.
+///
+/// No name, title or email column. This slice keeps the audit trail - who was
+/// evaluated, against what, with what outcome - without becoming a second copy
+/// of a lead database; `personRef` and the provider reference are enough to
+/// fetch the person again from the provider that holds them.
+model ProspectCandidate {
+  id          String         @id @default(uuid()) @db.Uuid
+  searchRunId String         @map("search_run_id") @db.Uuid
+  companyId   String?        @map("company_id") @db.Uuid
+  /// Provider id, e.g. `apollo`.
+  provider    String         @db.VarChar(64)
+  /// The provider's own key for this person.
+  externalId  String         @map("external_id") @db.VarChar(128)
+  /// Pointer back to the provider record, e.g. `apollo:person:5f2a...`.
+  personRef   String         @map("person_ref") @db.VarChar(255)
+  state       CandidateState
+  /// `[{ reason, detail }]`; empty for a survivor.
+  rejections  Json
+  createdAt   DateTime       @default(now()) @map("created_at")
+
+  run        SearchRun           @relation(fields: [searchRunId], references: [id], onDelete: Cascade)
+  company    Company?            @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  enrichment ProspectEnrichment?
+
+  @@unique([searchRunId, personRef])
+  @@index([companyId])
+  @@index([state])
+  @@map("prospect_candidates")
+}
+
+/// What the contact data provider was asked, and what it answered.
+///
+/// The three states the *provider* can reach, plus the two the pipeline can:
+/// NOT_REQUESTED for a candidate that was never sent (over the run's budget, or
+/// carrying too weak an identity to ask about without guessing), and FAILED for
+/// an unexpected provider or transport error.
+///
+/// UNAVAILABLE is kept apart from FAILED deliberately. A plan that does not
+/// include enrichment and a timed-out request look identical in a result list
+/// and call for opposite responses - one is fixed in the provider's console,
+/// the other by running the search again.
+enum EnrichmentStatus {
+  NOT_REQUESTED
+  ENRICHED
+  PARTIAL
+  NO_MATCH
+  UNAVAILABLE
+  FAILED
+}
+
+/// One candidate's contact details, as one provider reported them.
+///
+/// A child of `ProspectCandidate` rather than columns on it, and one row per
+/// candidate rather than a history, because the two answer different questions
+/// on different schedules: a candidate is *an observation by one run* and is
+/// never rewritten, while enrichment is a separately-billed lookup that can be
+/// retried against the same candidate. Keeping them apart means a re-run
+/// updates the contact details without touching the verdict that was recorded
+/// against the criteria of the day.
+///
+/// ## Why this table holds personal data where `prospect_candidates` refuses to
+///
+/// The candidate table deliberately stores no name, title or email: its job is
+/// the audit trail, and duplicating a lead database into it would have been a
+/// retention problem with no purpose behind it. This table has the purpose -
+/// a contact detail the user explicitly asked to retrieve and needs in order to
+/// act - so it holds exactly the contact channels and nothing more. There is
+/// still no raw provider payload column: nothing reads one, and it would carry
+/// far more personal data than the stage has a reason to keep.
+///
+/// Every field is nullable except the status and the provider, because every
+/// one of them is something a provider may simply not hold. A default would
+/// turn "not reported" into a claim.
+model ProspectEnrichment {
+  id                     String           @id @default(uuid()) @db.Uuid
+  candidateId            String           @unique @map("candidate_id") @db.Uuid
+  /// Provider id, e.g. `apollo`.
+  provider               String           @db.VarChar(64)
+  status                 EnrichmentStatus
+  /// The provider's confidence that it identified the right person: `high`,
+  /// `medium`, `low` or `none`. Never a lead score - see `EnrichedProspect`.
+  matchConfidence        String?          @map("match_confidence") @db.VarChar(16)
+  /// The provider's own key for the person, preserved so the record can be
+  /// re-fetched without repeating the identity resolution.
+  externalPersonId       String?          @map("external_person_id") @db.VarChar(128)
+  /// The provider's own key for the employer, preserved for the same reason.
+  externalOrganizationId String?          @map("external_organization_id") @db.VarChar(128)
+  /// Canonical profile URL, exactly as the provider returned it. Never derived
+  /// from a name.
+  linkedinUrl            String?          @map("linkedin_url") @db.VarChar(2048)
+  workEmail              String?          @map("work_email") @db.VarChar(320)
+  /// The provider's own label, e.g. `verified`. Kept verbatim.
+  emailStatus            String?          @map("email_status") @db.VarChar(32)
+  /// `[{ number, type, status }]`, exactly as the provider reported them.
+  /// Stored as JSON because a person has few of them, they are read as a whole,
+  /// and their shape is owned by a versioned contract rather than by the ORM.
+  phoneNumbers           Json             @map("phone_numbers")
+  /// NOT_REQUESTED, AVAILABLE, PENDING or NONE. Phone reveal is asynchronous,
+  /// so "still being fetched" and "the provider holds none" are different
+  /// facts that must not render identically.
+  phoneState             String           @map("phone_state") @db.VarChar(16)
+  /// Frontend-safe explanation for every status but ENRICHED. Never a provider
+  /// payload, a credential or an endpoint path.
+  detail                 String?
+  /// When the provider answered. Absent for a candidate that was never sent.
+  enrichedAt             DateTime?        @map("enriched_at")
+  createdAt              DateTime         @default(now()) @map("created_at")
+  updatedAt              DateTime         @updatedAt @map("updated_at")
+
+  candidate ProspectCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@index([provider, externalPersonId])
+  @@index([status])
+  @@map("prospect_enrichments")
+}

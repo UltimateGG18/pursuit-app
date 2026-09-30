@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pursuit-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pursuit
+      POSTGRES_PASSWORD: pursuit
+      POSTGRES_DB: pursuit
+    ports:
+      # 5432 on the host is often taken by a locally installed PostgreSQL,
+      # so the container is published on 55432 instead.
+      - '55432:5432'
+    volumes:
+      - pursuit-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U pursuit -d pursuit']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pursuit-pgdata:
